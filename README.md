@@ -1,35 +1,4 @@
-ด้านล่างคือ Version Production Stable ล่าสุด
-แก้ปัญหา:
-
-* Ubuntu 24
-* mpstat format
-* CPU Per Core
-* Docker unhealthy
-* Recovery Alert
-* Spam Alert
-* Telegram timeout
-* Invalid integer
-* Locale issue
-* systemd compatibility
-
-เรียบร้อยแล้ว
-
-รองรับ:
-
-* Docker
-* Docker Compose
-* Bun
-* Node.js
-* NestJS
-* ElysiaJS
-* PostgreSQL
-* Redis
-* nginx
-* n8n
-
----
-
-# 1. Install Dependencies
+# 1. ติดตั้ง Package
 
 ```bash
 sudo apt update
@@ -37,12 +6,13 @@ sudo apt update
 sudo apt install -y \
 curl \
 jq \
-sysstat
+sysstat \
+util-linux
 ```
 
 ---
 
-# 2. Create Directory
+# 2. สร้าง Folder
 
 ```bash
 sudo mkdir -p /opt/server-monitor/{state,logs}
@@ -61,15 +31,43 @@ BOT_TOKEN="YOUR_BOT_TOKEN"
 
 CHAT_ID="YOUR_CHAT_ID"
 
+# ==========================================
+# CPU
+# ==========================================
+
 CPU_LIMIT=90
+
 CPU_CORE_LIMIT=95
+
 CPU_RECOVERY=80
 
+CPU_COOLDOWN=300
+
+# ==========================================
+# RAM
+# ==========================================
+
 RAM_LIMIT=90
+
 RAM_RECOVERY=80
 
+RAM_COOLDOWN=300
+
+# ==========================================
+# DISK
+# ==========================================
+
 DISK_LIMIT=90
+
 DISK_RECOVERY=80
+
+DISK_COOLDOWN=1800
+
+# ==========================================
+# DOCKER
+# ==========================================
+
+DOCKER_COOLDOWN=300
 ```
 
 ---
@@ -77,12 +75,16 @@ DISK_RECOVERY=80
 # 4. monitor.sh
 
 ```bash
+sudo nano /opt/server-monitor/monitor.sh
+```
+
+```bash
 #!/bin/bash
 
 # =========================================================
 # SERVER MONITOR - PRODUCTION STABLE
 # Ubuntu 22 / Ubuntu 24
-# Docker / Bun / Node.js / NestJS / PostgreSQL
+# Docker / Bun / Node.js / PostgreSQL
 # =========================================================
 
 export LC_ALL=C
@@ -188,7 +190,6 @@ fi
 
 # =========================================================
 # MPSTAT
-# รองรับ 4 / 8 / 16 / 32 CORE
 # =========================================================
 
 MPSTAT_OUTPUT=$(mpstat -P ALL 1 1)
@@ -218,13 +219,11 @@ CORE_ALERTS=""
 while read -r cpu idle
 do
 
-    # skip invalid
     if [[ "$cpu" == "all" ]] || \
        [[ "$cpu" == "" ]]; then
         continue
     fi
 
-    # validate idle
     if ! [[ "$idle" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
         continue
     fi
@@ -310,11 +309,15 @@ LIMIT="$3"
 
 RECOVERY="$4"
 
-EMOJI="$5"
+COOLDOWN="$5"
+
+EMOJI="$6"
 
 STATE_FILE="${STATE_DIR}/${TYPE}.state"
 
 START_FILE="${STATE_DIR}/${TYPE}.start"
+
+LAST_ALERT_FILE="${STATE_DIR}/${TYPE}.last"
 
 # =====================================================
 # ALERT
@@ -322,13 +325,30 @@ START_FILE="${STATE_DIR}/${TYPE}.start"
 
 if [ "$VALUE" -ge "$LIMIT" ]; then
 
+    LAST_ALERT=0
+
+    if [ -f "$LAST_ALERT_FILE" ]; then
+        LAST_ALERT=$(cat "$LAST_ALERT_FILE")
+    fi
+
+    DIFF=$((NOW - LAST_ALERT))
+
+    if [ "$DIFF" -lt "$COOLDOWN" ] && \
+       [ -f "$STATE_FILE" ]; then
+        return
+    fi
+
     if [ ! -f "$STATE_FILE" ]; then
 
         touch "$STATE_FILE"
 
         echo "$NOW" > "$START_FILE"
 
-        send_telegram "${EMOJI} ${TYPE} ALERT
+    fi
+
+    echo "$NOW" > "$LAST_ALERT_FILE"
+
+    send_telegram "${EMOJI} ${TYPE} ALERT
 
 🖥 Server: ${HOSTNAME}
 
@@ -352,9 +372,7 @@ ${TOP_CPU}
 🧠 TOP RAM:
 ${TOP_RAM}"
 
-        log "${TYPE} ALERT ${VALUE}%"
-
-    fi
+    log "${TYPE} ALERT ${VALUE}%"
 
 # =====================================================
 # RECOVERY
@@ -375,6 +393,8 @@ elif [ "$VALUE" -le "$RECOVERY" ]; then
         rm -f "$STATE_FILE"
 
         rm -f "$START_FILE"
+
+        rm -f "$LAST_ALERT_FILE"
 
         send_telegram "✅ ${TYPE} RECOVERED
 
@@ -403,13 +423,27 @@ fi
 
 DOCKER_STATE_FILE="${STATE_DIR}/docker-engine.state"
 
+DOCKER_LAST_FILE="${STATE_DIR}/docker-engine.last"
+
 DOCKER_STATUS=$(systemctl is-active docker 2>/dev/null)
 
 if [ "$DOCKER_STATUS" != "active" ]; then
 
-    if [ ! -f "$DOCKER_STATE_FILE" ]; then
+    LAST_ALERT=0
 
-        echo "$NOW" > "$DOCKER_STATE_FILE"
+    if [ -f "$DOCKER_LAST_FILE" ]; then
+        LAST_ALERT=$(cat "$DOCKER_LAST_FILE")
+    fi
+
+    DIFF=$((NOW - LAST_ALERT))
+
+    if [ "$DIFF" -ge "$DOCKER_COOLDOWN" ]; then
+
+        echo "$NOW" > "$DOCKER_LAST_FILE"
+
+        if [ ! -f "$DOCKER_STATE_FILE" ]; then
+            echo "$NOW" > "$DOCKER_STATE_FILE"
+        fi
 
         send_telegram "🚨 DOCKER ENGINE DOWN
 
@@ -439,6 +473,8 @@ else
 
         rm -f "$DOCKER_STATE_FILE"
 
+        rm -f "$DOCKER_LAST_FILE"
+
         send_telegram "✅ DOCKER ENGINE RECOVERED
 
 🖥 Server: ${HOSTNAME}
@@ -467,47 +503,35 @@ docker ps -a \
 while IFS="|" read -r NAME STATUS
 do
 
-FILE="${STATE_DIR}/container-${NAME}.state"
+STATE_FILE="${STATE_DIR}/container-${NAME}.state"
+
+LAST_FILE="${STATE_DIR}/container-${NAME}.last"
 
 # =====================================================
-# UNHEALTHY
+# UNHEALTHY / DOWN
 # =====================================================
 
-if [[ "$STATUS" == *"unhealthy"* ]]; then
+if [[ "$STATUS" == *"unhealthy"* ]] || \
+   [[ "$STATUS" == *"Exited"* ]] || \
+   [[ "$STATUS" == *"Restarting"* ]]; then
 
-    if [ ! -f "$FILE" ]; then
+    LAST_ALERT=0
 
-        echo "$NOW" > "$FILE"
-
-        send_telegram "⚠️ CONTAINER UNHEALTHY
-
-🖥 Server: ${HOSTNAME}
-
-🌐 IP: ${SERVER_IP}
-
-🕒 Time: ${TIME}
-
-🐳 Container: ${NAME}
-
-📉 Status:
-${STATUS}"
-
-        log "CONTAINER UNHEALTHY ${NAME}"
-
+    if [ -f "$LAST_FILE" ]; then
+        LAST_ALERT=$(cat "$LAST_FILE")
     fi
 
-# =====================================================
-# DOWN
-# =====================================================
+    DIFF=$((NOW - LAST_ALERT))
 
-elif [[ "$STATUS" == *"Exited"* ]] || \
-     [[ "$STATUS" == *"Restarting"* ]]; then
+    if [ "$DIFF" -ge "$DOCKER_COOLDOWN" ]; then
 
-    if [ ! -f "$FILE" ]; then
+        echo "$NOW" > "$LAST_FILE"
 
-        echo "$NOW" > "$FILE"
+        if [ ! -f "$STATE_FILE" ]; then
+            echo "$NOW" > "$STATE_FILE"
+        fi
 
-        send_telegram "🚨 CONTAINER DOWN
+        send_telegram "🚨 CONTAINER ALERT
 
 🖥 Server: ${HOSTNAME}
 
@@ -520,7 +544,7 @@ elif [[ "$STATUS" == *"Exited"* ]] || \
 📉 Status:
 ${STATUS}"
 
-        log "CONTAINER DOWN ${NAME}"
+        log "CONTAINER ALERT ${NAME}"
 
     fi
 
@@ -530,9 +554,9 @@ ${STATUS}"
 
 else
 
-    if [ -f "$FILE" ]; then
+    if [ -f "$STATE_FILE" ]; then
 
-        START=$(cat "$FILE")
+        START=$(cat "$STATE_FILE")
 
         DURATION=$((NOW - START))
 
@@ -540,7 +564,9 @@ else
 
         SECONDS=$((DURATION % 60))
 
-        rm -f "$FILE"
+        rm -f "$STATE_FILE"
+
+        rm -f "$LAST_FILE"
 
         send_telegram "✅ CONTAINER RECOVERED
 
@@ -575,6 +601,7 @@ check_metric \
 "$CPU_USAGE" \
 "$CPU_LIMIT" \
 "$CPU_RECOVERY" \
+"$CPU_COOLDOWN" \
 "🔥"
 
 check_metric \
@@ -582,6 +609,7 @@ check_metric \
 "$RAM_USAGE" \
 "$RAM_LIMIT" \
 "$RAM_RECOVERY" \
+"$RAM_COOLDOWN" \
 "⚠️"
 
 check_metric \
@@ -589,6 +617,7 @@ check_metric \
 "$DISK_USAGE" \
 "$DISK_LIMIT" \
 "$DISK_RECOVERY" \
+"$DISK_COOLDOWN" \
 "💽"
 
 # =========================================================
@@ -664,7 +693,7 @@ sudo /opt/server-monitor/monitor.sh
 
 ---
 
-# ตรวจสอบ Timer
+# 10. ตรวจสอบ Timer
 
 ```bash
 systemctl list-timers | grep server-monitor
@@ -672,45 +701,8 @@ systemctl list-timers | grep server-monitor
 
 ---
 
-# ดู Log
+# 11. ดู Log
 
 ```bash
 cat /opt/server-monitor/logs/monitor.log
 ```
-
----
-
-# ตัวอย่าง Alert
-
-```text
-🔥 CPU ALERT
-
-🖥 Server: api-prod-01
-
-🌐 IP: 10.0.0.15
-
-📈 CPU: 96%
-
-🔥 Core 2: 99%
-🔥 Core 5: 97%
-
-🔥 TOP CPU:
-991 2 bun 98.1
-```
-
----
-
-# ตัวอย่าง Recovery
-
-```text
-✅ CPU RECOVERED
-
-🖥 Server: api-prod-01
-
-📉 Current CPU: 22%
-
-⏱ Incident Duration:
-12m 14s
-```
-
-
