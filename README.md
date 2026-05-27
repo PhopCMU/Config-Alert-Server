@@ -74,7 +74,7 @@ DISK_RECOVERY=80
 
 ---
 
-# 4. monitor.sh (old)
+# 4. monitor.sh
 
 ```bash
 #!/bin/bash
