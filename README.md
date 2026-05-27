@@ -74,16 +74,38 @@ DISK_RECOVERY=80
 
 ---
 
-# 4. monitor.sh
+# 4. monitor.sh (old)
 
 ```bash
 #!/bin/bash
 
+# =========================================================
+# SERVER MONITOR - PRODUCTION STABLE
+# Ubuntu 22 / Ubuntu 24
+# Docker / Bun / Node.js / NestJS / PostgreSQL
+# =========================================================
+
 export LC_ALL=C
+
+# =========================================================
+# BASE
+# =========================================================
 
 BASE_DIR="/opt/server-monitor"
 
 CONFIG_FILE="${BASE_DIR}/config.conf"
+
+STATE_DIR="${BASE_DIR}/state"
+
+LOG_DIR="${BASE_DIR}/logs"
+
+LOG_FILE="${LOG_DIR}/monitor.log"
+
+LOCK_FILE="/tmp/server-monitor.lock"
+
+# =========================================================
+# CHECK CONFIG
+# =========================================================
 
 if [ ! -f "$CONFIG_FILE" ]; then
     echo "config.conf not found"
@@ -92,13 +114,24 @@ fi
 
 source "$CONFIG_FILE"
 
-STATE_DIR="${BASE_DIR}/state"
-LOG_DIR="${BASE_DIR}/logs"
+# =========================================================
+# CREATE DIR
+# =========================================================
 
 mkdir -p "$STATE_DIR"
 mkdir -p "$LOG_DIR"
 
-LOG_FILE="${LOG_DIR}/monitor.log"
+# =========================================================
+# LOCK
+# =========================================================
+
+exec 200>"$LOCK_FILE"
+
+flock -n 200 || exit 1
+
+# =========================================================
+# SERVER INFO
+# =========================================================
 
 HOSTNAME=$(hostname)
 
@@ -108,34 +141,27 @@ TIME=$(date "+%Y-%m-%d %H:%M:%S")
 
 NOW=$(date +%s)
 
-LOCK_FILE="/tmp/server-monitor.lock"
-
-# ==================================================
-# LOCK FILE
-# ==================================================
-exec 200>$LOCK_FILE
-
-flock -n 200 || exit 1
-
-# ==================================================
+# =========================================================
 # LOG
-# ==================================================
+# =========================================================
+
 log() {
 
 echo "[$TIME] $1" >> "$LOG_FILE"
 
 }
 
-# ==================================================
+# =========================================================
 # TELEGRAM
-# ==================================================
+# =========================================================
+
 send_telegram() {
 
 MESSAGE="$1"
 
-curl --max-time 10 \
+curl -s \
+--max-time 10 \
 --retry 3 \
--s \
 -X POST \
 "https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
 -d chat_id="${CHAT_ID}" \
@@ -144,44 +170,125 @@ curl --max-time 10 \
 
 }
 
-# ==================================================
+# =========================================================
 # SAFE INTEGER
-# ==================================================
+# =========================================================
+
 safe_int() {
 
 VALUE="$1"
 
-[[ "$VALUE" =~ ^[0-9]+$ ]] && \
-echo "$VALUE" || echo "0"
+if [[ "$VALUE" =~ ^[0-9]+$ ]]; then
+    echo "$VALUE"
+else
+    echo "0"
+fi
 
 }
 
-# ==================================================
-# SYSTEM METRICS
-# ==================================================
+# =========================================================
+# MPSTAT
+# รองรับ 4 / 8 / 16 / 32 CORE
+# =========================================================
+
+MPSTAT_OUTPUT=$(mpstat -P ALL 1 1)
+
+# =========================================================
+# CPU TOTAL
+# =========================================================
+
+CPU_USAGE=$(echo "$MPSTAT_OUTPUT" | awk '
+
+/Average:/ && $2 == "all" {
+
+printf "%.0f", 100 - $NF
+
+}
+
+')
+
+CPU_USAGE=$(safe_int "$CPU_USAGE")
+
+# =========================================================
+# CPU PER CORE
+# =========================================================
+
+CORE_ALERTS=""
+
+while read -r cpu idle
+do
+
+    # skip invalid
+    if [[ "$cpu" == "all" ]] || \
+       [[ "$cpu" == "" ]]; then
+        continue
+    fi
+
+    # validate idle
+    if ! [[ "$idle" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        continue
+    fi
+
+    usage=$(awk -v idle="$idle" '
+    BEGIN {
+        printf "%.0f", 100 - idle
+    }')
+
+    usage=$(safe_int "$usage")
+
+    if [ "$usage" -ge "$CPU_CORE_LIMIT" ]; then
+
+        CORE_ALERTS="${CORE_ALERTS}
+🔥 Core ${cpu}: ${usage}%"
+
+    fi
+
+done < <(
+
+echo "$MPSTAT_OUTPUT" | awk '
+
+/Average:/ {
+
+print $2, $NF
+
+}
+
+'
+
+)
+
+# =========================================================
+# RAM
+# =========================================================
+
 RAM_USAGE=$(free | awk '/Mem:/ {
 print int($3/$2 * 100)
 }')
 
-CPU_USAGE=$(top -bn1 | awk '/Cpu/ {
-print 100 - $8
-}')
-
-CPU_USAGE=$(printf "%.0f" "$CPU_USAGE")
-
-DISK_USAGE=$(df / | awk 'END {
-print int($5)
-}')
-
 RAM_USAGE=$(safe_int "$RAM_USAGE")
 
-CPU_USAGE=$(safe_int "$CPU_USAGE")
+# =========================================================
+# DISK
+# =========================================================
+
+DISK_USAGE=$(df / | awk 'END {
+gsub("%","",$5)
+print $5
+}')
 
 DISK_USAGE=$(safe_int "$DISK_USAGE")
+
+# =========================================================
+# LOAD
+# =========================================================
 
 LOAD_AVG=$(uptime | awk -F'load average:' '{print $2}')
 
 UPTIME=$(uptime -p)
+
+# =========================================================
+# TOP PROCESS
+# =========================================================
 
 TOP_CPU=$(ps -eo pid,psr,comm,%cpu \
 --sort=-%cpu | head -2 | tail -1)
@@ -189,60 +296,30 @@ TOP_CPU=$(ps -eo pid,psr,comm,%cpu \
 TOP_RAM=$(ps -eo pid,comm,%mem \
 --sort=-%mem | head -2 | tail -1)
 
-# ==================================================
-# CPU PER CORE
-# ==================================================
-CORE_ALERTS=""
-
-while read -r line
-do
-
-CORE=$(echo "$line" | awk '{print $2}')
-
-IDLE=$(echo "$line" | awk '{print $NF}')
-
-if [[ "$CORE" == "CPU" ]] || \
-   [[ "$CORE" == "all" ]] || \
-   [[ "$CORE" == "" ]]; then
-    continue
-fi
-
-if ! [[ "$IDLE" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
-    continue
-fi
-
-USAGE=$(awk -v idle="$IDLE" '
-BEGIN {
-printf "%.0f", 100 - idle
-}')
-
-USAGE=$(safe_int "$USAGE")
-
-if [ "$USAGE" -ge "$CPU_CORE_LIMIT" ]; then
-
-CORE_ALERTS="${CORE_ALERTS}
-🔥 Core ${CORE}: ${USAGE}%"
-
-fi
-
-done < <(mpstat -P ALL 1 1 | tail -n +5)
-
-# ==================================================
+# =========================================================
 # CHECK METRIC
-# ==================================================
+# =========================================================
+
 check_metric() {
 
 TYPE="$1"
+
 VALUE="$2"
+
 LIMIT="$3"
+
 RECOVERY="$4"
+
 EMOJI="$5"
 
 STATE_FILE="${STATE_DIR}/${TYPE}.state"
 
 START_FILE="${STATE_DIR}/${TYPE}.start"
 
+# =====================================================
 # ALERT
+# =====================================================
+
 if [ "$VALUE" -ge "$LIMIT" ]; then
 
     if [ ! -f "$STATE_FILE" ]; then
@@ -279,7 +356,10 @@ ${TOP_RAM}"
 
     fi
 
+# =====================================================
 # RECOVERY
+# =====================================================
+
 elif [ "$VALUE" -le "$RECOVERY" ]; then
 
     if [ -f "$STATE_FILE" ]; then
@@ -293,6 +373,7 @@ elif [ "$VALUE" -le "$RECOVERY" ]; then
         SECONDS=$((DURATION % 60))
 
         rm -f "$STATE_FILE"
+
         rm -f "$START_FILE"
 
         send_telegram "✅ ${TYPE} RECOVERED
@@ -311,22 +392,24 @@ ${MINUTES}m ${SECONDS}s"
         log "${TYPE} RECOVERED ${VALUE}%"
 
     fi
+
 fi
 
 }
 
-# ==================================================
+# =========================================================
 # DOCKER ENGINE
-# ==================================================
-DOCKER_STATUS=$(systemctl is-active docker 2>/dev/null)
+# =========================================================
 
-DOCKER_FILE="${STATE_DIR}/docker-engine.state"
+DOCKER_STATE_FILE="${STATE_DIR}/docker-engine.state"
+
+DOCKER_STATUS=$(systemctl is-active docker 2>/dev/null)
 
 if [ "$DOCKER_STATUS" != "active" ]; then
 
-    if [ ! -f "$DOCKER_FILE" ]; then
+    if [ ! -f "$DOCKER_STATE_FILE" ]; then
 
-        echo "$NOW" > "$DOCKER_FILE"
+        echo "$NOW" > "$DOCKER_STATE_FILE"
 
         send_telegram "🚨 DOCKER ENGINE DOWN
 
@@ -344,9 +427,9 @@ if [ "$DOCKER_STATUS" != "active" ]; then
 
 else
 
-    if [ -f "$DOCKER_FILE" ]; then
+    if [ -f "$DOCKER_STATE_FILE" ]; then
 
-        START=$(cat "$DOCKER_FILE")
+        START=$(cat "$DOCKER_STATE_FILE")
 
         DURATION=$((NOW - START))
 
@@ -354,7 +437,7 @@ else
 
         SECONDS=$((DURATION % 60))
 
-        rm -f "$DOCKER_FILE"
+        rm -f "$DOCKER_STATE_FILE"
 
         send_telegram "✅ DOCKER ENGINE RECOVERED
 
@@ -372,11 +455,13 @@ ${MINUTES}m ${SECONDS}s"
         log "DOCKER ENGINE RECOVERED"
 
     fi
+
 fi
 
-# ==================================================
+# =========================================================
 # DOCKER CONTAINER
-# ==================================================
+# =========================================================
+
 docker ps -a \
 --format "{{.Names}}|{{.Status}}" | \
 while IFS="|" read -r NAME STATUS
@@ -384,7 +469,10 @@ do
 
 FILE="${STATE_DIR}/container-${NAME}.state"
 
+# =====================================================
 # UNHEALTHY
+# =====================================================
+
 if [[ "$STATUS" == *"unhealthy"* ]]; then
 
     if [ ! -f "$FILE" ]; then
@@ -408,7 +496,10 @@ ${STATUS}"
 
     fi
 
+# =====================================================
 # DOWN
+# =====================================================
+
 elif [[ "$STATUS" == *"Exited"* ]] || \
      [[ "$STATUS" == *"Restarting"* ]]; then
 
@@ -433,7 +524,10 @@ ${STATUS}"
 
     fi
 
+# =====================================================
 # RECOVERY
+# =====================================================
+
 else
 
     if [ -f "$FILE" ]; then
@@ -467,13 +561,15 @@ ${MINUTES}m ${SECONDS}s"
         log "CONTAINER RECOVERED ${NAME}"
 
     fi
+
 fi
 
 done
 
-# ==================================================
+# =========================================================
 # CHECK SYSTEM
-# ==================================================
+# =========================================================
+
 check_metric \
 "CPU" \
 "$CPU_USAGE" \
@@ -495,9 +591,10 @@ check_metric \
 "$DISK_RECOVERY" \
 "💽"
 
-# ==================================================
+# =========================================================
 # CLEAN OLD LOG
-# ==================================================
+# =========================================================
+
 find "$LOG_DIR" -type f -mtime +7 -delete
 ```
 
@@ -615,3 +712,5 @@ cat /opt/server-monitor/logs/monitor.log
 ⏱ Incident Duration:
 12m 14s
 ```
+
+
