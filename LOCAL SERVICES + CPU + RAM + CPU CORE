@@ -1,0 +1,676 @@
+โอเค เดี๋ยวสรุปใหม่เป็น Version “LOCAL SERVICES + CPU + RAM + CPU CORE” แบบ Production Ready ครบเลย
+
+Version นี้จะเช็ก:
+
+| Monitor           | Support |
+| ----------------- | ------- |
+| Local Services    | ✅       |
+| CPU Total         | ✅       |
+| CPU Per Core      | ✅       |
+| RAM               | ✅       |
+| Disk              | ✅       |
+| Recovery Alert    | ✅       |
+| Cooldown          | ✅       |
+| Telegram Alert    | ✅       |
+| Incident Duration | ✅       |
+
+เหมาะกับ:
+
+* nginx-ui
+* nginx
+* PostgreSQL
+* Redis
+* PM2
+* Bun
+* Node.js
+* NestJS
+* ElysiaJS
+* Native API
+
+---
+
+# STEP 1 — Install Package
+
+```bash id="6lwsdx"
+sudo apt update
+
+sudo apt install -y \
+curl \
+jq \
+sysstat \
+util-linux
+```
+
+---
+
+# STEP 2 — Create Folder
+
+```bash id="g0t04k"
+sudo mkdir -p /opt/server-monitor/{state,logs}
+```
+
+---
+
+# STEP 3 — config.conf
+
+```bash id="jlwm54"
+sudo nano /opt/server-monitor/config.conf
+```
+
+ใส่:
+
+```bash id="jlwm54b"
+BOT_TOKEN="YOUR_BOT_TOKEN"
+
+CHAT_ID="YOUR_CHAT_ID"
+
+# ==========================================
+# CPU
+# ==========================================
+
+CPU_LIMIT=90
+
+CPU_CORE_LIMIT=95
+
+CPU_RECOVERY=80
+
+CPU_COOLDOWN=300
+
+# ==========================================
+# RAM
+# ==========================================
+
+RAM_LIMIT=90
+
+RAM_RECOVERY=80
+
+RAM_COOLDOWN=300
+
+# ==========================================
+# DISK
+# ==========================================
+
+DISK_LIMIT=90
+
+DISK_RECOVERY=80
+
+DISK_COOLDOWN=1800
+
+# ==========================================
+# SERVICES
+# ==========================================
+
+SERVICE_COOLDOWN=300
+```
+
+---
+
+# STEP 4 — services.conf
+
+```bash id="h4m27d"
+sudo nano /opt/server-monitor/services.conf
+```
+
+ตัวอย่าง:
+
+```text id="qjlwm0"
+nginx
+nginx-ui
+postgresql
+redis-server
+pm2-root
+```
+
+---
+
+# STEP 5 — monitor.sh
+
+```bash id="91w7c9"
+sudo nano /opt/server-monitor/monitor.sh
+```
+
+ใส่ทั้งหมดนี้:
+
+```bash id="whh7bo"
+#!/bin/bash
+
+export LC_ALL=C
+
+# =========================================================
+# BASE
+# =========================================================
+
+BASE_DIR="/opt/server-monitor"
+
+CONFIG_FILE="${BASE_DIR}/config.conf"
+
+SERVICES_FILE="${BASE_DIR}/services.conf"
+
+STATE_DIR="${BASE_DIR}/state"
+
+LOG_DIR="${BASE_DIR}/logs"
+
+LOG_FILE="${LOG_DIR}/monitor.log"
+
+LOCK_FILE="/tmp/server-monitor.lock"
+
+# =========================================================
+# CONFIG
+# =========================================================
+
+if [ ! -f "$CONFIG_FILE" ]; then
+    echo "config.conf not found"
+    exit 1
+fi
+
+source "$CONFIG_FILE"
+
+mkdir -p "$STATE_DIR"
+mkdir -p "$LOG_DIR"
+
+# =========================================================
+# LOCK
+# =========================================================
+
+exec 200>"$LOCK_FILE"
+
+flock -n 200 || exit 1
+
+# =========================================================
+# SERVER
+# =========================================================
+
+HOSTNAME=$(hostname)
+
+SERVER_IP=$(hostname -I | awk '{print $1}')
+
+TIME=$(date "+%Y-%m-%d %H:%M:%S")
+
+NOW=$(date +%s)
+
+# =========================================================
+# LOG
+# =========================================================
+
+log() {
+
+echo "[$TIME] $1" >> "$LOG_FILE"
+
+}
+
+# =========================================================
+# TELEGRAM
+# =========================================================
+
+send_telegram() {
+
+MESSAGE="$1"
+
+curl -s \
+--max-time 10 \
+--retry 3 \
+-X POST \
+"https://api.telegram.org/bot${BOT_TOKEN}/sendMessage" \
+-d chat_id="${CHAT_ID}" \
+-d text="${MESSAGE}" \
+> /dev/null
+
+}
+
+# =========================================================
+# SAFE INTEGER
+# =========================================================
+
+safe_int() {
+
+VALUE="$1"
+
+if [[ "$VALUE" =~ ^[0-9]+$ ]]; then
+    echo "$VALUE"
+else
+    echo "0"
+fi
+
+}
+
+# =========================================================
+# MPSTAT
+# =========================================================
+
+MPSTAT_OUTPUT=$(mpstat -P ALL 1 1)
+
+# =========================================================
+# CPU TOTAL
+# =========================================================
+
+CPU_USAGE=$(echo "$MPSTAT_OUTPUT" | awk '
+
+/Average:/ && $2 == "all" {
+
+printf "%.0f", 100 - $NF
+
+}
+
+')
+
+CPU_USAGE=$(safe_int "$CPU_USAGE")
+
+# =========================================================
+# CPU PER CORE
+# =========================================================
+
+CORE_ALERTS=""
+
+while read -r cpu idle
+do
+
+    if [[ "$cpu" == "all" ]] || \
+       [[ "$cpu" == "" ]]; then
+        continue
+    fi
+
+    if ! [[ "$idle" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        continue
+    fi
+
+    usage=$(awk -v idle="$idle" '
+    BEGIN {
+        printf "%.0f", 100 - idle
+    }')
+
+    usage=$(safe_int "$usage")
+
+    if [ "$usage" -ge "$CPU_CORE_LIMIT" ]; then
+
+        CORE_ALERTS="${CORE_ALERTS}
+🔥 Core ${cpu}: ${usage}%"
+
+    fi
+
+done < <(
+
+echo "$MPSTAT_OUTPUT" | awk '
+
+/Average:/ {
+
+print $2, $NF
+
+}
+
+'
+
+)
+
+# =========================================================
+# RAM
+# =========================================================
+
+RAM_USAGE=$(free | awk '/Mem:/ {
+print int($3/$2 * 100)
+}')
+
+RAM_USAGE=$(safe_int "$RAM_USAGE")
+
+# =========================================================
+# DISK
+# =========================================================
+
+DISK_USAGE=$(df / | awk 'END {
+gsub("%","",$5)
+print $5
+}')
+
+DISK_USAGE=$(safe_int "$DISK_USAGE")
+
+# =========================================================
+# LOAD
+# =========================================================
+
+LOAD_AVG=$(uptime | awk -F'load average:' '{print $2}')
+
+UPTIME=$(uptime -p)
+
+# =========================================================
+# TOP PROCESS
+# =========================================================
+
+TOP_CPU=$(ps -eo pid,psr,comm,%cpu \
+--sort=-%cpu | head -2 | tail -1)
+
+TOP_RAM=$(ps -eo pid,comm,%mem \
+--sort=-%mem | head -2 | tail -1)
+
+# =========================================================
+# CHECK METRIC
+# =========================================================
+
+check_metric() {
+
+TYPE="$1"
+
+VALUE="$2"
+
+LIMIT="$3"
+
+RECOVERY="$4"
+
+COOLDOWN="$5"
+
+EMOJI="$6"
+
+STATE_FILE="${STATE_DIR}/${TYPE}.state"
+
+START_FILE="${STATE_DIR}/${TYPE}.start"
+
+LAST_ALERT_FILE="${STATE_DIR}/${TYPE}.last"
+
+# =====================================================
+# ALERT
+# =====================================================
+
+if [ "$VALUE" -ge "$LIMIT" ]; then
+
+    LAST_ALERT=0
+
+    if [ -f "$LAST_ALERT_FILE" ]; then
+        LAST_ALERT=$(cat "$LAST_ALERT_FILE")
+    fi
+
+    DIFF=$((NOW - LAST_ALERT))
+
+    if [ "$DIFF" -lt "$COOLDOWN" ] && \
+       [ -f "$STATE_FILE" ]; then
+        return
+    fi
+
+    if [ ! -f "$STATE_FILE" ]; then
+
+        touch "$STATE_FILE"
+
+        echo "$NOW" > "$START_FILE"
+
+    fi
+
+    echo "$NOW" > "$LAST_ALERT_FILE"
+
+    send_telegram "${EMOJI} ${TYPE} ALERT
+
+🖥 Server: ${HOSTNAME}
+
+🌐 IP: ${SERVER_IP}
+
+🕒 Time: ${TIME}
+
+📈 ${TYPE}: ${VALUE}%
+
+⚠️ Threshold: ${LIMIT}%
+
+${CORE_ALERTS}
+
+📊 Load Avg:${LOAD_AVG}
+
+⏳ Uptime:${UPTIME}
+
+🔥 TOP CPU:
+${TOP_CPU}
+
+🧠 TOP RAM:
+${TOP_RAM}"
+
+    log "${TYPE} ALERT ${VALUE}%"
+
+# =====================================================
+# RECOVERY
+# =====================================================
+
+elif [ "$VALUE" -le "$RECOVERY" ]; then
+
+    if [ -f "$STATE_FILE" ]; then
+
+        START=$(cat "$START_FILE")
+
+        DURATION=$((NOW - START))
+
+        MINUTES=$((DURATION / 60))
+
+        SECONDS=$((DURATION % 60))
+
+        rm -f "$STATE_FILE"
+
+        rm -f "$START_FILE"
+
+        rm -f "$LAST_ALERT_FILE"
+
+        send_telegram "✅ ${TYPE} RECOVERED
+
+🖥 Server: ${HOSTNAME}
+
+🌐 IP: ${SERVER_IP}
+
+🕒 Time: ${TIME}
+
+📉 Current ${TYPE}: ${VALUE}%
+
+⏱ Incident Duration:
+${MINUTES}m ${SECONDS}s"
+
+        log "${TYPE} RECOVERED ${VALUE}%"
+
+    fi
+
+fi
+
+}
+
+# =========================================================
+# LOCAL SERVICES CHECK
+# =========================================================
+
+if [ -f "$SERVICES_FILE" ]; then
+
+while read -r SERVICE
+do
+
+    [[ -z "$SERVICE" ]] && continue
+
+    [[ "$SERVICE" =~ ^# ]] && continue
+
+    STATE_FILE="${STATE_DIR}/service-${SERVICE}.state"
+
+    LAST_FILE="${STATE_DIR}/service-${SERVICE}.last"
+
+    STATUS=$(systemctl is-active "$SERVICE" 2>/dev/null)
+
+    if [ "$STATUS" != "active" ]; then
+
+        LAST_ALERT=0
+
+        if [ -f "$LAST_FILE" ]; then
+            LAST_ALERT=$(cat "$LAST_FILE")
+        fi
+
+        DIFF=$((NOW - LAST_ALERT))
+
+        if [ "$DIFF" -ge "$SERVICE_COOLDOWN" ]; then
+
+            echo "$NOW" > "$LAST_FILE"
+
+            if [ ! -f "$STATE_FILE" ]; then
+                echo "$NOW" > "$STATE_FILE"
+            fi
+
+            send_telegram "🚨 LOCAL SERVICE DOWN
+
+🖥 Server: ${HOSTNAME}
+
+🌐 IP: ${SERVER_IP}
+
+🕒 Time: ${TIME}
+
+⚙️ Service:
+${SERVICE}
+
+📉 Status:
+${STATUS}"
+
+            log "LOCAL SERVICE DOWN ${SERVICE}"
+
+        fi
+
+    else
+
+        if [ -f "$STATE_FILE" ]; then
+
+            START=$(cat "$STATE_FILE")
+
+            DURATION=$((NOW - START))
+
+            MINUTES=$((DURATION / 60))
+
+            SECONDS=$((DURATION % 60))
+
+            rm -f "$STATE_FILE"
+
+            rm -f "$LAST_FILE"
+
+            send_telegram "✅ LOCAL SERVICE RECOVERED
+
+🖥 Server: ${HOSTNAME}
+
+🌐 IP: ${SERVER_IP}
+
+🕒 Time: ${TIME}
+
+⚙️ Service:
+${SERVICE}
+
+📈 Status:
+${STATUS}
+
+⏱ Downtime:
+${MINUTES}m ${SECONDS}s"
+
+            log "LOCAL SERVICE RECOVERED ${SERVICE}"
+
+        fi
+
+    fi
+
+done < "$SERVICES_FILE"
+
+fi
+
+# =========================================================
+# CHECK SYSTEM
+# =========================================================
+
+check_metric \
+"CPU" \
+"$CPU_USAGE" \
+"$CPU_LIMIT" \
+"$CPU_RECOVERY" \
+"$CPU_COOLDOWN" \
+"🔥"
+
+check_metric \
+"RAM" \
+"$RAM_USAGE" \
+"$RAM_LIMIT" \
+"$RAM_RECOVERY" \
+"$RAM_COOLDOWN" \
+"⚠️"
+
+check_metric \
+"DISK" \
+"$DISK_USAGE" \
+"$DISK_LIMIT" \
+"$DISK_RECOVERY" \
+"$DISK_COOLDOWN" \
+"💽"
+
+# =========================================================
+# CLEAN OLD LOG
+# =========================================================
+
+find "$LOG_DIR" -type f -mtime +7 -delete
+```
+
+---
+
+# STEP 6 — Permission
+
+```bash id="9jlwm9"
+sudo chmod +x /opt/server-monitor/monitor.sh
+```
+
+---
+
+# STEP 7 — Test
+
+```bash id="3jlwm1"
+sudo /opt/server-monitor/monitor.sh
+```
+
+---
+
+# STEP 8 — systemd service
+
+```bash id="4jlwm2"
+sudo nano /etc/systemd/system/server-monitor.service
+```
+
+```ini id="5jlwm3"
+[Unit]
+Description=Server Monitor
+
+[Service]
+Type=oneshot
+ExecStart=/opt/server-monitor/monitor.sh
+```
+
+---
+
+# STEP 9 — systemd timer
+
+```bash id="6jlwm4"
+sudo nano /etc/systemd/system/server-monitor.timer
+```
+
+```ini id="7jlwm5"
+[Unit]
+Description=Run Server Monitor Every Minute
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+Unit=server-monitor.service
+
+[Install]
+WantedBy=timers.target
+```
+
+---
+
+# STEP 10 — Enable
+
+```bash id="8jlwm6"
+sudo systemctl daemon-reload
+
+sudo systemctl enable --now server-monitor.timer
+```
+
+---
+
+# STEP 11 — Check Status
+
+```bash id="9jlwm7"
+systemctl status server-monitor.timer
+```
+
+---
+
+# STEP 12 — View Logs
+
+```bash id="1jlwm8"
+cat /opt/server-monitor/logs/monitor.log
+```
